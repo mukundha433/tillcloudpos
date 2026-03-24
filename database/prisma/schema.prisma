@@ -1,0 +1,517 @@
+// schema.prisma — TillCloud Phase 1 Complete Database Schema
+// Generator: Prisma Client (Node.js)
+// Database: PostgreSQL 15
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  CASHIER
+  KITCHEN
+}
+
+enum OrderType {
+  DINE_IN
+  PICKUP
+  DELIVERY
+  IN_STORE
+}
+
+enum BillStatus {
+  OPEN           // Bill created, items being added
+  KOT_SENT       // Save & Send tapped, KOT dispatched
+  AWAITING_PAYMENT // Delivery orders waiting for driver
+  PAID           // Payment confirmed and complete
+  VOIDED         // Voided by authorised staff
+}
+
+enum KotStatus {
+  SENT           // KOT dispatched to kitchen
+  BUMPED         // Kitchen moved to bump queue
+  READY          // Kitchen marked order complete
+  UPDATED        // Cashier added items after first KOT
+}
+
+enum PaymentMethod {
+  CASH
+  TYRO_CARD
+  TYRO_TAP
+  TYRO_APPLE_PAY
+  TYRO_GOOGLE_PAY
+  LOYALTY_REDEMPTION
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  DECLINED
+  CANCELLED
+  REFUNDED
+}
+
+enum DeliveryPaymentMethod {
+  CASH_ON_DELIVERY
+  CARD_ON_DELIVERY
+}
+
+enum TaxMode {
+  INCLUSIVE      // Price includes GST (most common AU restaurants)
+  EXCLUSIVE      // GST added on top of price
+  NONE           // No tax applied
+}
+
+enum TerminalType {
+  BILLING_COUNTER
+  KITCHEN_DISPLAY
+}
+
+enum InventoryMovementType {
+  SALE           // Automatic deduction on bill paid
+  ADD            // Manual stock addition
+  REMOVE         // Manual removal
+  SET_EXACT      // Stocktake correction
+  ADJUSTMENT     // Other adjustment
+}
+
+enum LoyaltyTransactionType {
+  EARN
+  REDEEM
+  MANUAL_ADD
+  MANUAL_DEDUCT
+  EXPIRE
+}
+
+
+// ─────────────────────────────────────────────
+// RESTAURANT (Top-level Tenant)
+// ─────────────────────────────────────────────
+
+model Restaurant {
+  id              String   @id @default(cuid())
+  name            String
+  businessType    String   @default("Restaurant") // Restaurant / Café / Bar / Food Truck / Bakery
+  abn             String?  // Australian Business Number — optional, shown on receipts
+  streetAddress   String
+  suburb          String
+  state           String   @default("NSW")
+  postcode        String
+  phone           String?
+  contactEmail    String?
+  logoUrl         String?
+  timezone        String   @default("Australia/Sydney")
+  thankYouMessage String?  @db.VarChar(100)
+
+  // Tax Configuration
+  taxMode         TaxMode  @default(INCLUSIVE)
+  taxRate         Decimal  @default(10.00) @db.Decimal(5,2) // GST % rate
+
+  // Loyalty Configuration
+  loyaltyEnabled  Boolean  @default(true)
+  pointsPerDollar Decimal  @default(0.1) @db.Decimal(5,4) // e.g. 0.1 = 1pt per $10
+  redemptionPoints Int     @default(50)   // Points needed per step
+  redemptionValue  Decimal @default(5.00) @db.Decimal(8,2) // $ value per step
+
+  // Tyro EFTPOS Configuration
+  tyroMerchantId  String?
+  tyroTerminalId  String?
+  tyroConnected   Boolean  @default(false)
+  tyroConnectedAt DateTime?
+
+  // SMS Credits
+  smsCredits      Int      @default(0)
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  users           User[]
+  terminals       Terminal[]
+  menuCategories  MenuCategory[]
+  menuItems       MenuItem[]
+  inventoryItems  InventoryItem[]
+  customers       Customer[]
+  bills           Bill[]
+  rolePermissions RolePermission[]
+  inviteTokens    InviteToken[]
+  smsLogs         SmsLog[]
+
+  @@map("restaurants")
+}
+
+
+// ─────────────────────────────────────────────
+// USER (Staff Members)
+// ─────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  restaurantId String
+  fullName     String
+  email        String
+  passwordHash String?  // null for kitchen role (no login)
+  pinHash      String?  // 4-digit PIN for POS login (cashier/manager)
+  role         UserRole @default(CASHIER)
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  bills        Bill[]      @relation("CashierBills")
+  invitesSent  InviteToken[] @relation("InvitedBy")
+
+  @@unique([restaurantId, email])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// INVITE TOKENS (Staff Onboarding)
+// ─────────────────────────────────────────────
+
+model InviteToken {
+  id           String    @id @default(cuid())
+  restaurantId String
+  email        String
+  role         UserRole
+  token        String    @unique @default(cuid())
+  invitedById  String
+  usedAt       DateTime?
+  expiresAt    DateTime  // 48 hours from creation
+  createdAt    DateTime  @default(now())
+
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  invitedBy    User       @relation("InvitedBy", fields: [invitedById], references: [id])
+
+  @@map("invite_tokens")
+}
+
+// ─────────────────────────────────────────────
+// TERMINAL (POS Device or Kitchen Display)
+// ─────────────────────────────────────────────
+
+model Terminal {
+  id           String       @id @default(cuid())
+  restaurantId String
+  name         String       // "Front Counter", "Bar", "Kitchen Screen"
+  deviceLabel  String?      // "iPad-01" — internal reference
+  type         TerminalType @default(BILLING_COUNTER)
+  isActive     Boolean      @default(true)
+  pairingCode  String?      @unique // 6-digit code for kitchen displays
+  pairedAt     DateTime?    // When kitchen tablet was paired
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  restaurant   Restaurant   @relation(fields: [restaurantId], references: [id])
+  bills        Bill[]
+
+  @@map("terminals")
+}
+
+
+// ─────────────────────────────────────────────
+// MENU
+// ─────────────────────────────────────────────
+
+model MenuCategory {
+  id           String     @id @default(cuid())
+  restaurantId String
+  name         String
+  sortOrder    Int        @default(0) // Controls tab order on POS
+  isActive     Boolean    @default(true) // OFF hides entire category from POS
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  menuItems    MenuItem[]
+
+  @@unique([restaurantId, name])
+  @@map("menu_categories")
+}
+
+model MenuItem {
+  id              String       @id @default(cuid())
+  restaurantId    String
+  categoryId      String
+  name            String       @db.VarChar(60)
+  description     String?      @db.VarChar(200)
+  priceInCents    Int          // Stored as cents to avoid float issues. $18.50 = 1850
+  sortOrder       Int          @default(0)
+  isActive        Boolean      @default(true)
+  trackInventory  Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  restaurant      Restaurant   @relation(fields: [restaurantId], references: [id])
+  category        MenuCategory @relation(fields: [categoryId], references: [id])
+  inventoryItem   InventoryItem?
+  billItems       BillItem[]
+
+  @@map("menu_items")
+}
+
+
+// ─────────────────────────────────────────────
+// INVENTORY
+// ─────────────────────────────────────────────
+
+model InventoryItem {
+  id              String    @id @default(cuid())
+  restaurantId    String
+  menuItemId      String    @unique // One-to-one with MenuItem
+  name            String    // Can differ from menu item name
+  quantity        Decimal   @db.Decimal(10,3) // Supports kg/litres with 3dp
+  unit            String    @default("pieces") // kg / litres / pieces / portions
+  lowStockThreshold Decimal @db.Decimal(10,3)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  restaurant      Restaurant         @relation(fields: [restaurantId], references: [id])
+  menuItem        MenuItem           @relation(fields: [menuItemId], references: [id])
+  movements       InventoryMovement[]
+
+  @@map("inventory_items")
+}
+
+model InventoryMovement {
+  id              String                @id @default(cuid())
+  inventoryItemId String
+  type            InventoryMovementType
+  quantityChange  Decimal               @db.Decimal(10,3) // Positive = add, negative = remove
+  quantityAfter   Decimal               @db.Decimal(10,3) // Snapshot after change
+  reason          String?               // Required for manual adjustments
+  billId          String?               // If triggered by a sale
+  performedById   String?               // Staff member who made manual adjustment
+  createdAt       DateTime              @default(now())
+
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+
+  @@map("inventory_movements")
+}
+
+
+// ─────────────────────────────────────────────
+// CUSTOMER & LOYALTY
+// ─────────────────────────────────────────────
+
+model Customer {
+  id              String    @id @default(cuid())
+  restaurantId    String
+  phone           String
+  name            String?   // Optional — captured if provided at POS
+  email           String?
+  loyaltyPoints   Int       @default(0)
+  totalVisits     Int       @default(0)
+  totalSpentCents Int       @default(0)
+  lastVisitAt     DateTime?
+  notes           String?   // Private staff notes — not shown to customer
+  memberSince     DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  restaurant         Restaurant           @relation(fields: [restaurantId], references: [id])
+  bills              Bill[]
+  loyaltyTransactions LoyaltyTransaction[]
+
+  @@unique([restaurantId, phone])
+  @@map("customers")
+}
+
+model LoyaltyTransaction {
+  id          String                 @id @default(cuid())
+  customerId  String
+  billId      String?                // Linked bill if earn/redeem
+  type        LoyaltyTransactionType
+  pointsDelta Int                    // Positive = earn/add, negative = redeem/deduct
+  balanceAfter Int                   // Running balance snapshot
+  reason      String?                // Required for manual adjustments
+  performedById String?              // Staff who made manual adjustment
+  createdAt   DateTime               @default(now())
+
+  customer    Customer @relation(fields: [customerId], references: [id])
+
+  @@map("loyalty_transactions")
+}
+
+
+// ─────────────────────────────────────────────
+// BILLING
+// ─────────────────────────────────────────────
+
+model Bill {
+  id              String     @id @default(cuid())
+  restaurantId    String
+  orderNumber     Int        // Daily sequence, resets each morning. e.g. 42
+  orderType       OrderType
+  status          BillStatus @default(OPEN)
+
+  // Cashier and terminal
+  cashierId       String
+  terminalId      String?
+
+  // Customer (optional — attached via loyalty lookup)
+  customerId      String?
+
+  // Order type specific fields
+  tableNumber     String?    // Dine In only
+  pickupName      String?    // Pickup only
+  
+  // Delivery fields
+  deliveryName    String?
+  deliveryAddress String?
+  deliverySuburb  String?
+  deliveryState   String?
+  deliveryPostcode String?
+  deliveryPhone   String?
+  deliveryNotes   String?
+  deliveryPaymentMethod DeliveryPaymentMethod?
+
+  // Pricing
+  subtotalCents   Int        @default(0) // Sum of line items before tax (if exclusive)
+  taxAmountCents  Int        @default(0) // GST amount
+  discountCents   Int        @default(0) // Manual discount or loyalty redemption
+  totalCents      Int        @default(0) // Final amount to pay
+
+  // Tax snapshot (captured at time of sale)
+  taxMode         TaxMode
+  taxRate         Decimal    @db.Decimal(5,2)
+
+  kotSentAt       DateTime?
+  paidAt          DateTime?
+  voidedAt        DateTime?
+  voidedById      String?
+  voidReason      String?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  restaurant      Restaurant   @relation(fields: [restaurantId], references: [id])
+  cashier         User         @relation("CashierBills", fields: [cashierId], references: [id])
+  terminal        Terminal?    @relation(fields: [terminalId], references: [id])
+  customer        Customer?    @relation(fields: [customerId], references: [id])
+  items           BillItem[]
+  payments        Payment[]
+  kitchenOrders   KitchenOrder[]
+
+  @@map("bills")
+}
+
+model BillItem {
+  id              String   @id @default(cuid())
+  billId          String
+  menuItemId      String?  // Null if item was deleted after sale (data preserved)
+  
+  // Snapshot at time of sale — never changes even if menu item changes
+  itemName        String
+  categoryName    String
+  unitPriceInCents Int
+  quantity        Int
+  lineTotalCents  Int      // unitPrice * quantity
+  notes           String?  // Per-item cashier note: "No onion", "Extra shot"
+
+  createdAt       DateTime @default(now())
+
+  bill            Bill      @relation(fields: [billId], references: [id])
+  menuItem        MenuItem? @relation(fields: [menuItemId], references: [id])
+
+  @@map("bill_items")
+}
+
+
+// ─────────────────────────────────────────────
+// KITCHEN ORDERS (KOT)
+// ─────────────────────────────────────────────
+
+model KitchenOrder {
+  id              String    @id @default(cuid())
+  billId          String
+  kotNumber       Int       // Sequence within the bill — 1 for first KOT, 2 for update
+  status          KotStatus @default(SENT)
+  isUpdate        Boolean   @default(false) // True if sent after first KOT (added items)
+
+  sentAt          DateTime  @default(now())
+  bumpedAt        DateTime?
+  recalledAt      DateTime?
+  readyAt         DateTime?
+
+  bill            Bill      @relation(fields: [billId], references: [id])
+
+  @@map("kitchen_orders")
+}
+
+// ─────────────────────────────────────────────
+// PAYMENTS
+// ─────────────────────────────────────────────
+
+model Payment {
+  id              String        @id @default(cuid())
+  billId          String
+  method          PaymentMethod
+  amountCents     Int
+  status          PaymentStatus @default(PENDING)
+
+  // Tyro-specific fields
+  tyroTransactionId String?
+  tyroReference     String?
+  tyroResponseCode  String?
+
+  // Cash-specific
+  cashTenderedCents Int?     // What customer handed over
+  changeCents       Int?     // Change given back
+
+  processedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  bill            Bill @relation(fields: [billId], references: [id])
+
+  @@map("payments")
+}
+
+// ─────────────────────────────────────────────
+// SMS CREDITS & LOGS
+// ─────────────────────────────────────────────
+
+model SmsLog {
+  id              String   @id @default(cuid())
+  restaurantId    String
+  billId          String?
+  toPhone         String
+  messageType     String   @default("RECEIPT") // RECEIPT / INVITE / PIN_RESET
+  twilioMessageId String?
+  status          String   @default("SENT")    // SENT / DELIVERED / FAILED
+  creditsUsed     Int      @default(1)
+  createdAt       DateTime @default(now())
+
+  restaurant      Restaurant @relation(fields: [restaurantId], references: [id])
+
+  @@map("sms_logs")
+}
+
+// ─────────────────────────────────────────────
+// ROLE PERMISSIONS
+// ─────────────────────────────────────────────
+
+model RolePermission {
+  id              String   @id @default(cuid())
+  restaurantId    String
+  role            UserRole // MANAGER or CASHIER only (ADMIN always full, KITCHEN always view)
+  permission      String   // e.g. "billing.void_bill", "reports.view_all"
+  isEnabled       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+
+  restaurant      Restaurant @relation(fields: [restaurantId], references: [id])
+
+  @@unique([restaurantId, role, permission])
+  @@map("role_permissions")
+}

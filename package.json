@@ -1,0 +1,10 @@
+{
+  "name": "tillcloudpos-monorepo",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend",
+    "database",
+    "shared"
+  ]
+}
